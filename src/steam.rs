@@ -8,6 +8,8 @@ use std::path::{Path, PathBuf};
 pub struct SteamGame {
     pub name: String,
     pub appid: String,
+    #[serde(default)]
+    pub last_played: u64,
 }
 
 pub fn installed_games() -> io::Result<Vec<SteamGame>> {
@@ -62,7 +64,11 @@ pub fn installed_games_from_root(steam_root: &Path) -> io::Result<Vec<SteamGame>
         }
     }
 
-    games.sort_by(|a, b| a.appid.cmp(&b.appid));
+    games.sort_by(|a, b| {
+        b.last_played
+            .cmp(&a.last_played)
+            .then_with(|| a.appid.cmp(&b.appid))
+    });
     Ok(games)
 }
 
@@ -93,6 +99,7 @@ fn parse_library_paths(libraryfolders_file: &Path) -> io::Result<Vec<PathBuf>> {
 fn parse_appmanifest(content: &str) -> Option<SteamGame> {
     let mut name = None;
     let mut appid = None;
+    let mut last_played = 0_u64;
 
     for line in content.lines() {
         let quoted = quoted_values(line);
@@ -103,6 +110,11 @@ fn parse_appmanifest(content: &str) -> Option<SteamGame> {
         match quoted[0].as_str() {
             "name" => name = Some(quoted[1].clone()),
             "appid" => appid = Some(quoted[1].clone()),
+            "LastPlayed" => {
+                if let Ok(parsed) = quoted[1].parse::<u64>() {
+                    last_played = parsed;
+                }
+            }
             _ => {}
         }
     }
@@ -110,6 +122,7 @@ fn parse_appmanifest(content: &str) -> Option<SteamGame> {
     Some(SteamGame {
         name: name?,
         appid: appid?,
+        last_played,
     })
 }
 
@@ -216,10 +229,12 @@ mod tests {
                 SteamGame {
                     name: "Counter-Strike".to_string(),
                     appid: "10".to_string(),
+                    last_played: 0,
                 },
                 SteamGame {
                     name: "Team Fortress Classic".to_string(),
                     appid: "20".to_string(),
+                    last_played: 0,
                 },
             ]
         );
@@ -253,6 +268,7 @@ mod tests {
             vec![SteamGame {
                 name: "Counter-Strike 2".to_string(),
                 appid: "730".to_string(),
+                last_played: 0,
             }]
         );
     }
@@ -322,7 +338,46 @@ mod tests {
             vec![SteamGame {
                 name: "Hollow Knight: Silksong".to_string(),
                 appid: "1030300".to_string(),
+                last_played: 0,
             }]
         );
+    }
+
+    #[test]
+    fn sorts_by_last_played_descending() {
+        let tmp = tempfile::tempdir().expect("failed to create temp dir");
+        let steam_root = tmp.path().join(".steam");
+        let steamapps = steam_root.join("steam").join("steamapps");
+
+        write_file(
+            &steamapps.join("appmanifest_10.acf"),
+            concat!(
+                "\"AppState\"\n",
+                "{\n",
+                "  \"appid\"\t\"10\"\n",
+                "  \"name\"\t\"Older Game\"\n",
+                "  \"LastPlayed\"\t\"100\"\n",
+                "}\n"
+            ),
+        );
+
+        write_file(
+            &steamapps.join("appmanifest_20.acf"),
+            concat!(
+                "\"AppState\"\n",
+                "{\n",
+                "  \"appid\"\t\"20\"\n",
+                "  \"name\"\t\"Newer Game\"\n",
+                "  \"LastPlayed\"\t\"200\"\n",
+                "}\n"
+            ),
+        );
+
+        let games = installed_games_from_root(&steam_root).expect("failed to load games");
+        let names: Vec<&str> = games.iter().map(|g| g.name.as_str()).collect();
+
+        assert_eq!(names, vec!["Newer Game", "Older Game"]);
+        assert_eq!(games[0].last_played, 200);
+        assert_eq!(games[1].last_played, 100);
     }
 }
