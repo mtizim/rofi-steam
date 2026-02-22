@@ -2,10 +2,10 @@ mod steam;
 
 use std::env;
 use std::fs;
-use std::io::Write;
+use std::fs::File;
 use std::path::PathBuf;
+use std::process;
 use std::process::{Command, Stdio};
-use std::thread;
 use steam::SteamGame;
 
 const LAUNCH_STR: &str = "launch";
@@ -41,13 +41,6 @@ fn refresh_cache_sync() -> Vec<Game> {
     games
 }
 
-fn refresh_cache_async() {
-    thread::spawn(|| {
-        let games = steam::installed_games().unwrap_or_default();
-        write_cache(&games);
-    });
-}
-
 fn get_menu_selection(games: &[Game]) -> MenuChoice {
     let formatted = games
         .iter()
@@ -55,23 +48,24 @@ fn get_menu_selection(games: &[Game]) -> MenuChoice {
         .collect::<Vec<_>>()
         .join("\n");
 
-    let mut rofi = Command::new("rofi")
+    // Prewrite rofi input, then attach it as stdin at spawn time.
+    let input_path = env::temp_dir().join(format!("rofi-steam-input-{}.txt", process::id()));
+    let _ = fs::write(&input_path, formatted.as_bytes());
+    let stdin_file = File::open(&input_path).expect("failed to prepare rofi stdin");
+
+    let output = Command::new("rofi")
         .arg("-monitor")
         .arg("1")
         .arg("-i")
         .arg("-dmenu")
+        .arg("-sync")
         .arg("-p")
         .arg(LAUNCH_STR)
-        .stdin(Stdio::piped())
+        .stdin(Stdio::from(stdin_file))
         .stdout(Stdio::piped())
-        .spawn()
+        .output()
         .expect("failed to run rofi");
-
-    if let Some(stdin) = rofi.stdin.as_mut() {
-        let _ = stdin.write_all(formatted.as_bytes());
-    }
-
-    let output = rofi.wait_with_output().expect("failed waiting for rofi");
+    let _ = fs::remove_file(&input_path);
     let selected = String::from_utf8_lossy(&output.stdout)
         .lines()
         .last()
@@ -97,12 +91,9 @@ fn launch_game(appid: &str) {
 }
 
 fn main() {
-    let games_list = match read_cache() {
-        Some(cached) => {
-            refresh_cache_async();
-            cached
-        }
-        None => refresh_cache_sync(),
+    let (games_list, used_cached_data) = match read_cache() {
+        Some(cached) => (cached, true),
+        None => (refresh_cache_sync(), false),
     };
 
     match get_menu_selection(&games_list) {
@@ -111,5 +102,9 @@ fn main() {
             launch_game(&game.appid);
         }
         MenuChoice::None => {}
+    }
+
+    if used_cached_data {
+        let _ = refresh_cache_sync();
     }
 }
