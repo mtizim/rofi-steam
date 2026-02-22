@@ -11,6 +11,9 @@ use steam::SteamGame;
 const LAUNCH_STR: &str = "launch";
 
 type Game = SteamGame;
+const DISPLAY_WIDTH: usize = 125;
+const HOURS_COL_WIDTH: usize = 8;
+const COL_SPACER: &str = "  ";
 
 #[derive(Debug)]
 enum MenuChoice {
@@ -42,9 +45,23 @@ fn refresh_cache_sync() -> Vec<Game> {
 }
 
 fn get_menu_selection(games: &[Game]) -> MenuChoice {
-    let formatted = games
+    let title_width = DISPLAY_WIDTH.saturating_sub(HOURS_COL_WIDTH + COL_SPACER.len());
+    let menu_rows: Vec<(String, Game)> = games
         .iter()
-        .map(|game| game.name.clone())
+        .cloned()
+        .map(|game| {
+            let title = truncate_title(&game.name, title_width);
+            let hours = format_hours(game.playtime_minutes);
+            let row = format!(
+                "{:<title_width$}{COL_SPACER}{:>HOURS_COL_WIDTH$}",
+                title, hours
+            );
+            (row, game)
+        })
+        .collect();
+    let formatted = menu_rows
+        .iter()
+        .map(|(row, _)| row.as_str())
         .collect::<Vec<_>>()
         .join("\n");
 
@@ -72,13 +89,31 @@ fn get_menu_selection(games: &[Game]) -> MenuChoice {
         .unwrap_or("")
         .to_string();
 
-    for game in games {
-        if selected == game.name {
-            return MenuChoice::Launch(game.clone());
+    for (row, game) in menu_rows {
+        if selected == row {
+            return MenuChoice::Launch(game);
         }
     }
 
     MenuChoice::None
+}
+
+fn format_hours(playtime_minutes: u64) -> String {
+    format!("{}h", playtime_minutes / 60)
+}
+
+fn truncate_title(title: &str, max_chars: usize) -> String {
+    if max_chars == 0 {
+        return String::new();
+    }
+    let count = title.chars().count();
+    if count <= max_chars {
+        return title.to_string();
+    }
+    if max_chars <= 3 {
+        return ".".repeat(max_chars);
+    }
+    title.chars().take(max_chars - 3).collect::<String>() + "..."
 }
 
 fn launch_game(appid: &str) {
@@ -106,5 +141,23 @@ fn main() {
 
     if used_cached_data {
         let _ = refresh_cache_sync();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn formats_hours_in_hours_unit() {
+        assert_eq!(format_hours(0), "0h");
+        assert_eq!(format_hours(90), "1h");
+    }
+
+    #[test]
+    fn truncates_long_titles_with_ellipsis() {
+        assert_eq!(truncate_title("abcdef", 6), "abcdef");
+        assert_eq!(truncate_title("abcdefg", 6), "abc...");
+        assert_eq!(truncate_title("abcdef", 2), "..");
     }
 }

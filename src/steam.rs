@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::env;
 use std::fs;
 use std::io;
@@ -10,6 +10,8 @@ pub struct SteamGame {
     pub appid: String,
     #[serde(default)]
     pub last_played: u64,
+    #[serde(default)]
+    pub playtime_minutes: u64,
 }
 
 pub fn installed_games() -> io::Result<Vec<SteamGame>> {
@@ -21,6 +23,7 @@ pub fn installed_games() -> io::Result<Vec<SteamGame>> {
 pub fn installed_games_from_root(steam_root: &Path) -> io::Result<Vec<SteamGame>> {
     let primary_steamapps = steam_root.join("steam").join("steamapps");
     let mut library_paths = parse_library_paths(&primary_steamapps.join("libraryfolders.vdf"))?;
+    let playtimes = parse_playtimes(steam_root);
 
     if library_paths.is_empty() {
         library_paths.push(steam_root.join("steam"));
@@ -58,7 +61,10 @@ pub fn installed_games_from_root(steam_root: &Path) -> io::Result<Vec<SteamGame>
 
             if let Some(game) = parse_appmanifest(&content) {
                 if is_game_entry(&game) && seen.insert(game.appid.clone()) {
-                    games.push(game);
+                    games.push(SteamGame {
+                        playtime_minutes: playtimes.get(&game.appid).copied().unwrap_or(0),
+                        ..game
+                    });
                 }
             }
         }
@@ -123,7 +129,67 @@ fn parse_appmanifest(content: &str) -> Option<SteamGame> {
         name: name?,
         appid: appid?,
         last_played,
+        playtime_minutes: 0,
     })
+}
+
+fn parse_playtimes(steam_root: &Path) -> HashMap<String, u64> {
+    let mut result = HashMap::new();
+    let userdata = steam_root.join("steam").join("userdata");
+    let entries = match fs::read_dir(userdata) {
+        Ok(entries) => entries,
+        Err(_) => return result,
+    };
+
+    for entry in entries.flatten() {
+        let config = entry.path().join("config").join("localconfig.vdf");
+        let content = match fs::read_to_string(config) {
+            Ok(content) => content,
+            Err(_) => continue,
+        };
+
+        for (appid, minutes) in parse_localconfig_playtimes(&content) {
+            let current = result.entry(appid).or_insert(0);
+            if minutes > *current {
+                *current = minutes;
+            }
+        }
+    }
+
+    result
+}
+
+fn parse_localconfig_playtimes(content: &str) -> HashMap<String, u64> {
+    let mut playtimes = HashMap::new();
+    let mut stack: Vec<String> = Vec::new();
+    let mut pending_key: Option<String> = None;
+
+    for line in content.lines() {
+        let quoted = quoted_values(line);
+
+        if quoted.len() == 1 {
+            pending_key = Some(quoted[0].clone());
+        } else if quoted.len() >= 2 && quoted[0] == "Playtime" {
+            if stack.len() >= 2 && stack[stack.len() - 2] == "apps" {
+                if let Ok(minutes) = quoted[1].parse::<u64>() {
+                    let appid = stack[stack.len() - 1].clone();
+                    playtimes.insert(appid, minutes);
+                }
+            }
+        }
+
+        for ch in line.chars() {
+            if ch == '{' {
+                if let Some(key) = pending_key.take() {
+                    stack.push(key);
+                }
+            } else if ch == '}' {
+                let _ = stack.pop();
+            }
+        }
+    }
+
+    playtimes
 }
 
 fn is_game_entry(game: &SteamGame) -> bool {
@@ -230,11 +296,13 @@ mod tests {
                     name: "Counter-Strike".to_string(),
                     appid: "10".to_string(),
                     last_played: 0,
+                    playtime_minutes: 0,
                 },
                 SteamGame {
                     name: "Team Fortress Classic".to_string(),
                     appid: "20".to_string(),
                     last_played: 0,
+                    playtime_minutes: 0,
                 },
             ]
         );
@@ -269,6 +337,7 @@ mod tests {
                 name: "Counter-Strike 2".to_string(),
                 appid: "730".to_string(),
                 last_played: 0,
+                playtime_minutes: 0,
             }]
         );
     }
@@ -339,6 +408,7 @@ mod tests {
                 name: "Hollow Knight: Silksong".to_string(),
                 appid: "1030300".to_string(),
                 last_played: 0,
+                playtime_minutes: 0,
             }]
         );
     }
@@ -379,5 +449,62 @@ mod tests {
         assert_eq!(names, vec!["Newer Game", "Older Game"]);
         assert_eq!(games[0].last_played, 200);
         assert_eq!(games[1].last_played, 100);
+        assert_eq!(games[0].playtime_minutes, 0);
+        assert_eq!(games[1].playtime_minutes, 0);
+    }
+
+    #[test]
+    fn loads_playtime_from_localconfig() {
+        let tmp = tempfile::tempdir().expect("failed to create temp dir");
+        let steam_root = tmp.path().join(".steam");
+        let steamapps = steam_root.join("steam").join("steamapps");
+        let localconfig = steam_root
+            .join("steam")
+            .join("userdata")
+            .join("123")
+            .join("config")
+            .join("localconfig.vdf");
+
+        write_file(
+            &steamapps.join("appmanifest_20.acf"),
+            concat!(
+                "\"AppState\"\n",
+                "{\n",
+                "  \"appid\"\t\"20\"\n",
+                "  \"name\"\t\"Newer Game\"\n",
+                "  \"LastPlayed\"\t\"200\"\n",
+                "}\n"
+            ),
+        );
+
+        write_file(
+            &localconfig,
+            concat!(
+                "\"UserLocalConfigStore\"\n",
+                "{\n",
+                "  \"Software\"\n",
+                "  {\n",
+                "    \"Valve\"\n",
+                "    {\n",
+                "      \"Steam\"\n",
+                "      {\n",
+                "        \"apps\"\n",
+                "        {\n",
+                "          \"20\"\n",
+                "          {\n",
+                "            \"Playtime\"\t\"321\"\n",
+                "          }\n",
+                "        }\n",
+                "      }\n",
+                "    }\n",
+                "  }\n",
+                "}\n"
+            ),
+        );
+
+        let games = installed_games_from_root(&steam_root).expect("failed to load games");
+        assert_eq!(games.len(), 1);
+        assert_eq!(games[0].appid, "20");
+        assert_eq!(games[0].playtime_minutes, 321);
     }
 }
